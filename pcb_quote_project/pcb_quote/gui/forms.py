@@ -4,13 +4,13 @@ import json
 from typing import Any
 from dataclasses import asdict
 
-from PySide6.QtCore import Qt, Signal, QTimer
+from PySide6.QtCore import Qt, Signal, QTimer, QObject, QEvent
 from PySide6.QtGui import QColor, QBrush, QFont
 from PySide6.QtWidgets import (
     QWidget, QFormLayout, QDoubleSpinBox, QSpinBox, QCheckBox, QVBoxLayout,
     QPushButton, QTabWidget, QHBoxLayout, QGroupBox, QLabel,
     QTableWidget, QTableWidgetItem, QDialog, QDialogButtonBox, QGridLayout,
-    QHeaderView, QSizePolicy, QAbstractItemView, QSplitter, QFileDialog, QMessageBox
+    QHeaderView, QSizePolicy, QAbstractItemView, QFileDialog, QMessageBox
 )
 
 from matplotlib.figure import Figure
@@ -21,6 +21,35 @@ from pcb_quote.models import (
     ComponentsInputs, HighSpeedInputs, HighSpeedInterface, Tariffs
 )
 from pcb_quote.calculations import estimate_layout_quote, QuoteCoeffs, DEFAULT_COEFFS
+
+
+# -----------------------------
+# Helpers: focus/selection clear
+# -----------------------------
+class _ClearSelectionFilter(QObject):
+    """
+    Event filter che, quando il widget (o suoi figli) riceve un click,
+    rimuove la selezione da tutte le tabelle registrate, a meno che il click
+    avvenga dentro una di quelle tabelle.
+    """
+    def __init__(self, tables: list[QTableWidget]):
+        super().__init__()
+        self._tables = tables
+
+    def eventFilter(self, obj: QObject, event: QEvent) -> bool:
+        if event.type() == QEvent.MouseButtonPress:
+            for t in self._tables:
+                if t is None:
+                    continue
+                if t.viewport().underMouse() or t.underMouse():
+                    return False
+
+            for t in self._tables:
+                if t is None:
+                    continue
+                t.clearSelection()
+                t.setCurrentCell(-1, -1)
+        return False
 
 
 # ---------- Helpers UI ----------
@@ -41,57 +70,84 @@ def _ro_item(s: str) -> QTableWidgetItem:
     it = QTableWidgetItem(str(s))
     it.setFlags(it.flags() & ~Qt.ItemIsEditable)
     it.setTextAlignment(Qt.AlignVCenter | Qt.AlignLeft)
+    it.setData(Qt.TextAlignmentRole, int(Qt.AlignVCenter | Qt.AlignLeft))
     return it
 
 
 def _num_item(val: str) -> QTableWidgetItem:
     it = QTableWidgetItem(val)
     it.setTextAlignment(Qt.AlignVCenter | Qt.AlignRight)
+    it.setData(Qt.TextAlignmentRole, int(Qt.AlignVCenter | Qt.AlignRight))
     return it
 
 
 def _text_item(val: str) -> QTableWidgetItem:
     it = QTableWidgetItem(val)
     it.setTextAlignment(Qt.AlignVCenter | Qt.AlignLeft)
+    it.setData(Qt.TextAlignmentRole, int(Qt.AlignVCenter | Qt.AlignLeft))
     return it
 
 
-def _configure_table(tbl: QTableWidget, stretch_last: bool = True):
+def _configure_table(
+    tbl: QTableWidget,
+    *,
+    stretch_last: bool = True,
+    editable: bool = True,
+    selection_rows: bool = True,
+):
     tbl.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
     tbl.setAlternatingRowColors(True)
     tbl.setShowGrid(True)
+    tbl.setWordWrap(False)
+    tbl.setTextElideMode(Qt.ElideNone)
+
+    if editable:
+        tbl.setEditTriggers(
+            QAbstractItemView.DoubleClicked |
+            QAbstractItemView.EditKeyPressed |
+            QAbstractItemView.AnyKeyPressed |
+            QAbstractItemView.SelectedClicked
+        )
+    else:
+        tbl.setEditTriggers(QAbstractItemView.NoEditTriggers)
+
+    if selection_rows:
+        tbl.setSelectionBehavior(QAbstractItemView.SelectRows)
+    else:
+        tbl.setSelectionBehavior(QAbstractItemView.SelectItems)
+
+    tbl.setSelectionMode(QAbstractItemView.SingleSelection)
     tbl.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
     tbl.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
 
     vh = tbl.verticalHeader()
     vh.setVisible(True)
-    vh.setDefaultSectionSize(30)
+    vh.setDefaultSectionSize(28)
     vh.setMinimumSectionSize(18)
-    vh.setSectionResizeMode(QHeaderView.Interactive)
-    vh.setSectionsMovable(True)
+    vh.setSectionResizeMode(QHeaderView.Fixed)
+    vh.setSectionsMovable(False)
 
     hh = tbl.horizontalHeader()
-    hh.setStretchLastSection(stretch_last)
-    hh.setSectionResizeMode(QHeaderView.Interactive)
     hh.setDefaultAlignment(Qt.AlignLeft | Qt.AlignVCenter)
     hh.setSectionsMovable(True)
-    hh.setFixedHeight(32)
-
-    tbl.setWordWrap(True)
-    tbl.setSelectionBehavior(QAbstractItemView.SelectRows)
-    tbl.setSelectionMode(QAbstractItemView.SingleSelection)
+    hh.setFixedHeight(30)
+    hh.setSectionResizeMode(QHeaderView.ResizeToContents)
+    hh.setStretchLastSection(stretch_last)
 
 
-def make_table_interactive(tbl: QTableWidget):
-    tbl.horizontalHeader().setSectionsMovable(True)
-    tbl.verticalHeader().setSectionsMovable(True)
-    tbl.setDragEnabled(True)
-    tbl.setAcceptDrops(True)
-    tbl.setDragDropMode(QAbstractItemView.InternalMove)
-    tbl.setDropIndicatorShown(True)
-    tbl.setDefaultDropAction(Qt.MoveAction)
-    tbl.setSelectionBehavior(QAbstractItemView.SelectRows)
-    tbl.setSelectionMode(QAbstractItemView.SingleSelection)
+def _autosize_table(tbl: QTableWidget, max_visible_rows: int = 12):
+    try:
+        tbl.resizeColumnsToContents()
+        tbl.resizeRowsToContents()
+    except Exception:
+        pass
+
+    rows = max(1, min(tbl.rowCount(), max_visible_rows))
+    row_h = tbl.verticalHeader().defaultSectionSize()
+    header_h = tbl.horizontalHeader().height()
+    frame = tbl.frameWidth() * 2
+    total_h = header_h + rows * row_h + frame + 12
+    tbl.setMinimumHeight(total_h)
 
 
 # ---------- Parsers tolleranti ----------
@@ -177,10 +233,13 @@ def _parse_hs_entry(it: Any):
                 ps = 50.0
             elif len(it) == 3:
                 name, gbps, dp = it
-                se = 0; ps = 50.0
+                se = 0
+                ps = 50.0
             elif len(it) == 2:
                 name, gbps = it
-                dp = 0; se = 0; ps = 50.0
+                dp = 0
+                se = 0
+                ps = 50.0
             else:
                 return None
             return HighSpeedInterface(name=str(name), data_rate_gbps=float(gbps), diff_pairs=int(dp), se_lines=int(se), match_ps=float(ps))
@@ -301,16 +360,14 @@ class BoardTab(QWidget):
         holes_btn = QHBoxLayout(); self.hole_add = QPushButton("Aggiungi"); self.hole_del = QPushButton("Rimuovi")
         holes_btn.addWidget(self.hole_add); holes_btn.addWidget(self.hole_del); holes_btn.addStretch()
         self.holes_table = QTableWidget(0, 3); self.holes_table.setHorizontalHeaderLabels(["Diametro (mm)", "Metallizzazione (mm)", "Quantità"])
-        _configure_table(self.holes_table); make_table_interactive(self.holes_table)
-        for c in range(3): self.holes_table.horizontalHeader().setSectionResizeMode(c, QHeaderView.Interactive)
+        _configure_table(self.holes_table, editable=True)
         holes_v.addLayout(holes_btn); holes_v.addWidget(self.holes_table)
 
         keep_box = QGroupBox("Keep-out (rettangoli)"); keep_v = QVBoxLayout(keep_box)
         keep_btn = QHBoxLayout(); self.keep_add = QPushButton("Aggiungi"); self.keep_del = QPushButton("Rimuovi")
         keep_btn.addWidget(self.keep_add); keep_btn.addWidget(self.keep_del); keep_btn.addStretch()
         self.keep_table = QTableWidget(0, 4); self.keep_table.setHorizontalHeaderLabels(["Lato", "W (mm)", "H (mm)", "Qty"])
-        _configure_table(self.keep_table); make_table_interactive(self.keep_table)
-        for c in range(4): self.keep_table.horizontalHeader().setSectionResizeMode(c, QHeaderView.Interactive)
+        _configure_table(self.keep_table, editable=True)
         keep_v.addLayout(keep_btn); keep_v.addWidget(self.keep_table)
 
         row.addWidget(holes_box, 1); row.addWidget(keep_box, 1)
@@ -318,9 +375,9 @@ class BoardTab(QWidget):
 
         summary_box = QGroupBox("Riepilogo Area (calcolato)"); summary_layout = QVBoxLayout(summary_box)
         self.summary_table = QTableWidget(6, 3); self.summary_table.setHorizontalHeaderLabels(["Voce", "TOP", "BOTTOM"])
-        self.summary_table.verticalHeader().setVisible(False); _configure_table(self.summary_table); make_table_interactive(self.summary_table)
+        self.summary_table.verticalHeader().setVisible(False)
+        _configure_table(self.summary_table, editable=False)
         self.summary_table.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        for c in range(3): self.summary_table.horizontalHeader().setSectionResizeMode(c, QHeaderView.Interactive)
         summary_layout.addWidget(self.summary_table); outer.addWidget(summary_box)
 
         self.hole_add.clicked.connect(lambda: self.add_hole_row(3.2, 0.0, 1)); self.hole_del.clicked.connect(self.del_hole_row)
@@ -330,25 +387,41 @@ class BoardTab(QWidget):
         self.w_mm.valueChanged.connect(self._schedule_update); self.h_mm.valueChanged.connect(self._schedule_update)
         self.holes_table.itemChanged.connect(self._schedule_update); self.keep_table.itemChanged.connect(self._schedule_update)
 
-        self.add_hole_row(3.2, 0.0, 4); self.add_keepout_row("TOP", 20, 10, 2); self.add_keepout_row("BOTTOM", 15, 8, 2); self.update_area_summary()
+        self.add_hole_row(3.2, 0.0, 4)
+        self.add_keepout_row("TOP", 20, 10, 2)
+        self.add_keepout_row("BOTTOM", 15, 8, 2)
+        self.update_area_summary()
 
     def _schedule_update(self): self._debounce.start()
 
     def add_hole_row(self, diameter: float = 3.2, metall: float = 0.0, count: int = 1):
         r = self.holes_table.rowCount(); self.holes_table.insertRow(r)
-        self.holes_table.setItem(r, 0, _num_item(f"{float(diameter):.2f}")); self.holes_table.setItem(r, 1, _num_item(f"{float(metall):.3f}")); self.holes_table.setItem(r, 2, _num_item(str(int(count))))
+        self.holes_table.setItem(r, 0, _num_item(f"{float(diameter):.2f}"))
+        self.holes_table.setItem(r, 1, _num_item(f"{float(metall):.3f}"))
+        self.holes_table.setItem(r, 2, _num_item(str(int(count))))
+        _autosize_table(self.holes_table, max_visible_rows=10)
 
     def del_hole_row(self):
         r = self.holes_table.currentRow()
-        if r >= 0: self.holes_table.removeRow(r); self._schedule_update()
+        if r >= 0:
+            self.holes_table.removeRow(r)
+            self._schedule_update()
+            _autosize_table(self.holes_table, max_visible_rows=10)
 
     def add_keepout_row(self, side: str = "TOP", w: float = 10.0, h: float = 10.0, count: int = 1):
         r = self.keep_table.rowCount(); self.keep_table.insertRow(r)
-        self.keep_table.setItem(r, 0, _text_item(side)); self.keep_table.setItem(r, 1, _num_item(f"{float(w):.2f}")); self.keep_table.setItem(r, 2, _num_item(f"{float(h):.2f}")); self.keep_table.setItem(r, 3, _num_item(str(int(count))))
+        self.keep_table.setItem(r, 0, _text_item(side))
+        self.keep_table.setItem(r, 1, _num_item(f"{float(w):.2f}"))
+        self.keep_table.setItem(r, 2, _num_item(f"{float(h):.2f}"))
+        self.keep_table.setItem(r, 3, _num_item(str(int(count))))
+        _autosize_table(self.keep_table, max_visible_rows=10)
 
     def del_keepout_row(self):
         r = self.keep_table.currentRow()
-        if r >= 0: self.keep_table.removeRow(r); self._schedule_update()
+        if r >= 0:
+            self.keep_table.removeRow(r)
+            self._schedule_update()
+            _autosize_table(self.keep_table, max_visible_rows=10)
 
     def collect_holes(self):
         holes = []
@@ -380,9 +453,18 @@ class BoardTab(QWidget):
         return keepouts
 
     def update_area_summary(self):
-        board = BoardConstraints(width_mm=float(self.w_mm.value()), height_mm=float(self.h_mm.value()), holes=self.collect_holes(), keepouts=self.collect_keepouts())
+        board = BoardConstraints(
+            width_mm=float(self.w_mm.value()),
+            height_mm=float(self.h_mm.value()),
+            holes=self.collect_holes(),
+            keepouts=self.collect_keepouts(),
+        )
+
         def set_row(row: int, label: str, top: str, bottom: str):
-            self.summary_table.setItem(row, 0, _ro_item(label)); self.summary_table.setItem(row, 1, _ro_item(top)); self.summary_table.setItem(row, 2, _ro_item(bottom))
+            self.summary_table.setItem(row, 0, _ro_item(label))
+            self.summary_table.setItem(row, 1, _ro_item(top))
+            self.summary_table.setItem(row, 2, _ro_item(bottom))
+
         holes_cm2 = board.holes_area_mm2 / 100.0
         set_row(0, "Area lorda (cm²)", f"{board.gross_cm2:.1f}", f"{board.gross_cm2:.1f}")
         set_row(1, "Area fori (cm²)", f"{holes_cm2:.1f}", f"{holes_cm2:.1f}")
@@ -390,12 +472,8 @@ class BoardTab(QWidget):
         set_row(3, "Superficie Utile (cm²)", f"{board.usable_top_cm2:.1f}", f"{board.usable_bottom_cm2:.1f}")
         set_row(4, "Occupazione %", f"{board.occupied_top_pct:.1f}%", f"{board.occupied_bottom_pct:.1f}%")
         set_row(5, "Spazio libero %", f"{board.free_top_pct:.1f}%", f"{board.free_bottom_pct:.1f}%")
-        self.summary_table.resizeRowsToContents()
-        header_h = self.summary_table.horizontalHeader().height()
-        rows_h = sum(self.summary_table.rowHeight(r) for r in range(self.summary_table.rowCount()))
-        frame = self.summary_table.frameWidth() * 2; extra = 8
-        total_min_h = header_h + rows_h + frame + extra
-        self.summary_table.setMinimumHeight(total_min_h)
+
+        _autosize_table(self.summary_table, max_visible_rows=6)
 
 
 # ---------- ComponentsTab ----------
@@ -436,94 +514,199 @@ class ComponentsTab(QWidget):
         outer.addStretch()
 
 
-# ---------- HighSpeedTab (table sopra, chart sotto) ----------
+# ---------- HighSpeedTab (FORMATTATA come Risultati) ----------
 class HighSpeedTab(QWidget):
     def __init__(self):
         super().__init__()
         outer = QVBoxLayout(self)
+        outer.setSpacing(10)
+
         outer.addWidget(_note_label("Ogni riga = una interfaccia (JESD, DDR, Ethernet...). Matching ps: più basso = più complesso."))
 
-        splitter = QSplitter(Qt.Vertical)
+        # riga pulsanti
+        btn_row = QHBoxLayout()
+        self.add_btn = QPushButton("Aggiungi")
+        self.del_btn = QPushButton("Rimuovi")
+        btn_row.addWidget(self.add_btn)
+        btn_row.addWidget(self.del_btn)
+        btn_row.addStretch()
+        outer.addLayout(btn_row)
 
-        top = QWidget(); top_layout = QVBoxLayout(top)
-        btn_row = QHBoxLayout(); self.add_btn = QPushButton("Aggiungi"); self.del_btn = QPushButton("Rimuovi")
-        btn_row.addWidget(self.add_btn); btn_row.addWidget(self.del_btn); btn_row.addStretch()
-        top_layout.addLayout(btn_row)
+        # Layout a 2 colonne (come tab Risultati)
+        grid = QGridLayout()
+        grid.setSpacing(12)
+        outer.addLayout(grid)
+
+        # sinistra: tabella in un groupbox
+        left_box = QGroupBox("Interfacce High-speed")
+        left_layout = QVBoxLayout(left_box)
 
         self.table = QTableWidget(0, 6)
-        self.table.setHorizontalHeaderLabels(["Nome", "Gbps", "Diff pairs", "SE lines", "Match (ps)", "Ore"])
-        _configure_table(self.table); make_table_interactive(self.table)
-        for c in range(6): self.table.horizontalHeader().setSectionResizeMode(c, QHeaderView.Interactive)
-        top_layout.addWidget(self.table)
+        self.table.setHorizontalHeaderLabels(["Nome", "Gbps", "Diff pairs", "SE lines", "Match (ps)", "Ore (auto)"])
+        _configure_table(self.table, editable=True, stretch_last=True, selection_rows=True)
 
-        bottom = QWidget(); bottom_layout = QVBoxLayout(bottom)
-        self.pie_fig = Figure(figsize=(6, 3)); self.pie_canvas = FigureCanvas(self.pie_fig)
-        bottom_layout.addWidget(self.pie_canvas)
+        left_layout.addWidget(self.table)
+        grid.addWidget(left_box, 0, 0)
 
-        splitter.addWidget(top); splitter.addWidget(bottom)
-        splitter.setStretchFactor(0, 2); splitter.setStretchFactor(1, 1)
-        outer.addWidget(splitter)
+        # destra: grafico in un groupbox
+        right_box = QGroupBox("Distribuzione ore (HS)")
+        right_layout = QVBoxLayout(right_box)
 
-        self.add_btn.clicked.connect(lambda: self.add_row(("Interface", 10.0, 0, 0, 10.0)))
+        self.fig = Figure(figsize=(5, 4))
+        self.canvas = FigureCanvas(self.fig)
+        right_layout.addWidget(self.canvas)
+
+        grid.addWidget(right_box, 0, 1)
+
+        # proporzioni colonna
+        grid.setColumnStretch(0, 2)
+        grid.setColumnStretch(1, 1)
+
+        # wiring
+        self.add_btn.clicked.connect(lambda: self.add_row(("Interface", 10.0, 0, 0, 50.0)))
         self.del_btn.clicked.connect(self.del_row)
+        self.table.itemChanged.connect(self._on_item_changed)
+
+        # dati iniziali demo
         self.add_row(("JESD204", 10.0, 32, 0, 10.0))
 
+        _autosize_table(self.table, max_visible_rows=14)
+        self._render_chart()
+
+    def _row_values(self, r: int):
+        def cell(c: int) -> str:
+            return self.table.item(r, c).text().strip() if self.table.item(r, c) else ""
+        name = cell(0) or f"IF{r+1}"
+        gbps = float(cell(1) or 0.0)
+        dp = int(float(cell(2) or 0))
+        se = int(float(cell(3) or 0))
+        ps = float(cell(4) or 50.0)
+        return name, gbps, dp, se, ps
+
+    def _hours_hint(self, gbps: float, dp: int, se: int, ps: float) -> float:
+        # stima indicativa solo UI
+        return max(0.0, 0.10 * dp + 0.05 * se + 0.02 * gbps + max(0.0, (50.0 - ps)) * 0.01)
+
     def add_row(self, defaults=("Interface", 10.0, 0, 0, 10.0)):
-        r = self.table.rowCount(); self.table.insertRow(r)
+        r = self.table.rowCount()
+        self.table.insertRow(r)
         name, gbps, dp, se, ps = defaults
-        self.table.setItem(r, 0, _text_item(str(name))); self.table.setItem(r, 1, _num_item(f"{float(gbps):.2f}"))
-        self.table.setItem(r, 2, _num_item(str(int(dp)))); self.table.setItem(r, 3, _num_item(str(int(se))))
-        self.table.setItem(r, 4, _num_item(f"{float(ps):.2f}")); self.table.setItem(r, 5, _ro_item("0.0"))
-        self._adjust_table_height()
+
+        self.table.setItem(r, 0, _text_item(str(name)))
+        self.table.setItem(r, 1, _num_item(f"{float(gbps):.2f}"))
+        self.table.setItem(r, 2, _num_item(str(int(dp))))
+        self.table.setItem(r, 3, _num_item(str(int(se))))
+        self.table.setItem(r, 4, _num_item(f"{float(ps):.2f}"))
+
+        # ore auto: read-only
+        self.table.setItem(r, 5, _ro_item("0.0"))
+
+        self._recalc_row_hours(r)
+        _autosize_table(self.table, max_visible_rows=14)
+        self._render_chart()
 
     def del_row(self):
         r = self.table.currentRow()
-        if r >= 0: self.table.removeRow(r); self._adjust_table_height()
+        if r >= 0:
+            self.table.removeRow(r)
+            _autosize_table(self.table, max_visible_rows=14)
+            self._render_chart()
 
-    def _adjust_table_height(self, max_visible_rows: int = 12):
-        rows = max(1, min(self.table.rowCount(), max_visible_rows))
-        row_h = self.table.verticalHeader().defaultSectionSize()
-        header_h = self.table.horizontalHeader().height()
-        frame = self.table.frameWidth() * 2
-        total_h = header_h + rows * row_h + frame + 12
-        self.table.setMinimumHeight(total_h)
+    def _recalc_row_hours(self, r: int):
+        try:
+            _, gbps, dp, se, ps = self._row_values(r)
+        except Exception:
+            return
+        hint = self._hours_hint(gbps=gbps, dp=dp, se=se, ps=ps)
+        it = self.table.item(r, 5)
+        if it is None:
+            it = _ro_item("0.0")
+            self.table.setItem(r, 5, it)
+        it.setText(f"{hint:.1f}")
+
+    def _on_item_changed(self, item: QTableWidgetItem):
+        if item is None:
+            return
+        if item.column() == 5:
+            return
+        self._recalc_row_hours(item.row())
+        _autosize_table(self.table, max_visible_rows=14)
+        self._render_chart()
 
     def collect_interfaces(self):
         itfs = []
         for r in range(self.table.rowCount()):
-            def cell(c: int) -> str:
-                return self.table.item(r, c).text().strip() if self.table.item(r, c) else ""
-            name = cell(0) or f"IF{r+1}"
             try:
-                gbps = float(cell(1) or 0.0); dp = int(float(cell(2) or 0)); se = int(float(cell(3) or 0)); ps = float(cell(4) or 50.0)
-            except ValueError:
+                name, gbps, dp, se, ps = self._row_values(r)
+            except Exception:
                 continue
             itfs.append(HighSpeedInterface(name=name, data_rate_gbps=gbps, diff_pairs=dp, se_lines=se, match_ps=ps))
         return itfs
 
     def update_from_results(self, res: dict):
+        # aggiorna solo colonna ore (non blocca la tabella)
         hs = res.get("highspeed", {}).get("interfaces", [])
-        self.table.setRowCount(len(hs))
-        labels = []; sizes = []
         for r, it in enumerate(hs):
-            self.table.setItem(r, 0, _ro_item(it["name"])); self.table.setItem(r, 1, _ro_item(f"{it['data_rate_gbps']:.2f}"))
-            self.table.setItem(r, 2, _ro_item(str(int(it["diff_pairs"])))); self.table.setItem(r, 3, _ro_item(str(int(it["se_lines"]))))
-            self.table.setItem(r, 4, _ro_item(f"{it['match_ps']:.2f}"))
-            hrs = it.get("hours_total", 0.0); self.table.setItem(r, 5, _ro_item(f"{hrs:.1f}"))
-            labels.append(it["name"]); sizes.append(max(0.0, float(hrs)))
+            if r >= self.table.rowCount():
+                break
+            hrs = float(it.get("hours_total", 0.0))
+            cell = self.table.item(r, 5)
+            if cell is None:
+                cell = _ro_item("0.0")
+                self.table.setItem(r, 5, cell)
+            cell.setText(f"{hrs:.1f}")
 
-        self._adjust_table_height(max_visible_rows=20)
-        fig = self.pie_fig; fig.clear(); ax = fig.add_subplot(111)
-        if sum(sizes) > 0:
-            wedges, texts, autotexts = ax.pie(sizes, labels=None, autopct="%1.1f%%", startangle=90)
-            ax.legend(wedges, labels, loc="center left", bbox_to_anchor=(1.0, 0.5))
-            ax.set_title("Ore per interfaccia (HS)"); ax.axis('equal')
+        _autosize_table(self.table, max_visible_rows=14)
+        self._render_chart(from_results=hs)
+
+    def _render_chart(self, from_results: list[dict] | None = None):
+        """
+        Grafico consigliato al posto della pie:
+        bar chart orizzontale (più leggibile con molte interfacce).
+        """
+        labels: list[str] = []
+        values: list[float] = []
+
+        if from_results is not None:
+            for it in from_results:
+                labels.append(str(it.get("name", "")))
+                values.append(max(0.0, float(it.get("hours_total", 0.0))))
         else:
-            ax.text(0.5, 0.5, "Nessuna ora calcolata", ha='center', va='center'); ax.set_title("Ore per interfaccia (HS)")
-        fig.tight_layout(); self.pie_canvas.draw()
+            for r in range(self.table.rowCount()):
+                name = self.table.item(r, 0).text().strip() if self.table.item(r, 0) else f"IF{r+1}"
+                hrs = 0.0
+                try:
+                    hrs = float((self.table.item(r, 5).text().strip() if self.table.item(r, 5) else "0") or 0.0)
+                except Exception:
+                    hrs = 0.0
+                labels.append(name)
+                values.append(max(0.0, hrs))
+
+        fig = self.fig
+        fig.clear()
+        ax = fig.add_subplot(111)
+
+        if sum(values) <= 0 or len(values) == 0:
+            ax.text(0.5, 0.5, "Nessuna ora calcolata", ha="center", va="center")
+            ax.set_title("Ore per interfaccia (HS)")
+            fig.tight_layout()
+            self.canvas.draw()
+            return
+
+        # ordina per ore (leggibilità)
+        pairs = sorted(zip(labels, values), key=lambda x: x[1], reverse=True)
+        labels_s = [p[0] for p in pairs]
+        values_s = [p[1] for p in pairs]
+
+        ax.barh(labels_s, values_s)
+        ax.invert_yaxis()
+        ax.set_xlabel("Ore")
+        ax.set_title("Ore per interfaccia (HS)")
+        fig.tight_layout()
+        self.canvas.draw()
 
 
-# ---------- ResultsTab (solo Totals + 2 charts) ----------
+# ---------- ResultsTab ----------
 class ResultsTab(QWidget):
     def __init__(self):
         super().__init__()
@@ -532,13 +715,13 @@ class ResultsTab(QWidget):
 
         self.totals_table = QTableWidget(0, 5)
         self.totals_table.setHorizontalHeaderLabels(["Attività", "Ore", "Weeks", "Rate €/h", "Costo €"])
-        _configure_table(self.totals_table); make_table_interactive(self.totals_table)
+        _configure_table(self.totals_table, editable=False)
+        grid.addWidget(groupbox("Riepilogo Totali (somma voci rilevanti)", QVBoxLayout()), 0, 0)
+        grid.itemAtPosition(0, 0).widget().layout().addWidget(self.totals_table)
 
         self.pie_hours_fig = Figure(figsize=(5, 4)); self.pie_hours_canvas = FigureCanvas(self.pie_hours_fig)
         self.pie_cost_fig = Figure(figsize=(5, 4)); self.pie_cost_canvas = FigureCanvas(self.pie_cost_fig)
 
-        grid.addWidget(groupbox("Riepilogo Totali (somma voci rilevanti)", QVBoxLayout()), 0, 0)
-        grid.itemAtPosition(0, 0).widget().layout().addWidget(self.totals_table)
         grid.addWidget(self.pie_hours_canvas, 0, 1)
         grid.addWidget(self.pie_cost_canvas, 1, 1)
 
@@ -560,12 +743,14 @@ class ResultsTab(QWidget):
             "Routing STD": "Routing STD",
             "SI/PI": "SI/PI",
             "DFM Documentation (fixed)": "DFM - Documentazione (fissa)",
-            "DFM/Cleanup (proportional)": "DFM - Cleanup (proporz.)"
+            "DFM/Cleanup (proportional)": "DFM - Cleanup (proporz.)",
         }
 
         self.totals_table.setRowCount(len(totals_order) + 1)
         for r, k in enumerate(totals_order):
-            hrs = hours.get(k, 0.0); wks = weeks.get(k, 0.0); cost = costs.get(k, 0.0)
+            hrs = hours.get(k, 0.0)
+            wks = weeks.get(k, 0.0)
+            cost = costs.get(k, 0.0)
             rate_col = rates.get("si_pi") if k == "SI/PI" else rates.get("layout", 0.0)
             self.totals_table.setItem(r, 0, _ro_item(labels_it.get(k, k)))
             self.totals_table.setItem(r, 1, _ro_item(f"{hrs:.1f}"))
@@ -573,54 +758,87 @@ class ResultsTab(QWidget):
             self.totals_table.setItem(r, 3, _ro_item(f"{rate_col:.0f}"))
             self.totals_table.setItem(r, 4, _ro_item(f"{cost:.0f}"))
 
-        total_h = bd.get("totals", {}).get("hours", 0.0); total_w = bd.get("totals", {}).get("weeks", 0.0); total_c = bd.get("totals", {}).get("cost", 0.0)
+        total_h = bd.get("totals", {}).get("hours", 0.0)
+        total_w = bd.get("totals", {}).get("weeks", 0.0)
+        total_c = bd.get("totals", {}).get("cost", 0.0)
         last = len(totals_order)
-        item0 = _ro_item("TOTAL"); item1 = _ro_item(f"{total_h:.1f}"); item2 = _ro_item(f"{total_w:.2f}"); item3 = _ro_item(f"{rates.get('layout',0.0):.0f}"); item4 = _ro_item(f"{total_c:.0f}")
+
+        item0 = _ro_item("TOTAL")
+        item1 = _ro_item(f"{total_h:.1f}")
+        item2 = _ro_item(f"{total_w:.2f}")
+        item3 = _ro_item(f"{rates.get('layout', 0.0):.0f}")
+        item4 = _ro_item(f"{total_c:.0f}")
+
         bold_font = QFont(); bold_font.setBold(True)
-        for it in (item0, item1, item2, item3, item4): it.setFont(bold_font); it.setForeground(QBrush(QColor("#c0392b")))
-        self.totals_table.setItem(last, 0, item0); self.totals_table.setItem(last, 1, item1); self.totals_table.setItem(last, 2, item2); self.totals_table.setItem(last, 3, item3); self.totals_table.setItem(last, 4, item4)
-        self.totals_table.resizeRowsToContents()
-        self._adjust_table_height(self.totals_table, max_visible_rows=8)
+        for it in (item0, item1, item2, item3, item4):
+            it.setFont(bold_font)
+            it.setForeground(QBrush(QColor("#c0392b")))
+
+        self.totals_table.setItem(last, 0, item0)
+        self.totals_table.setItem(last, 1, item1)
+        self.totals_table.setItem(last, 2, item2)
+        self.totals_table.setItem(last, 3, item3)
+        self.totals_table.setItem(last, 4, item4)
+
+        _autosize_table(self.totals_table, max_visible_rows=8)
 
         # pie hours
-        labels = []; sizes = []
+        labels = []
+        sizes = []
         for k in totals_order:
             v = hours.get(k, 0.0)
-            if v > 0: labels.append(labels_it.get(k, k)); sizes.append(float(v))
-        fig = self.pie_hours_fig; fig.clear(); ax = fig.add_subplot(111)
+            if v > 0:
+                labels.append(labels_it.get(k, k))
+                sizes.append(float(v))
+
+        fig = self.pie_hours_fig
+        fig.clear()
+        ax = fig.add_subplot(111)
         if sum(sizes) > 0:
             wedges, texts, autotexts = ax.pie(sizes, labels=None, autopct="%1.1f%%", startangle=90)
-            ax.legend(wedges, labels, loc="center left", bbox_to_anchor=(1.0, 0.5)); ax.set_title("Distribuzione ore"); ax.axis('equal')
+            ax.legend(wedges, labels, loc="center left", bbox_to_anchor=(1.0, 0.5))
+            ax.set_title("Distribuzione ore")
+            ax.axis("equal")
         else:
-            ax.text(0.5, 0.5, "Nessuna ora", ha='center', va='center'); ax.set_title("Distribuzione ore")
-        fig.tight_layout(); self.pie_hours_canvas.draw()
+            ax.text(0.5, 0.5, "Nessuna ora", ha="center", va="center")
+            ax.set_title("Distribuzione ore")
+        fig.tight_layout()
+        self.pie_hours_canvas.draw()
 
         # pie cost
-        labels_c = []; sizes_c = []
+        labels_c = []
+        sizes_c = []
         for k in totals_order:
             v = costs.get(k, 0.0)
-            if v > 0: labels_c.append(labels_it.get(k, k)); sizes_c.append(float(v))
-        fig2 = self.pie_cost_fig; fig2.clear(); ax2 = fig2.add_subplot(111)
+            if v > 0:
+                labels_c.append(labels_it.get(k, k))
+                sizes_c.append(float(v))
+
+        fig2 = self.pie_cost_fig
+        fig2.clear()
+        ax2 = fig2.add_subplot(111)
         if sum(sizes_c) > 0:
             wedges, texts, autotexts = ax2.pie(sizes_c, labels=None, autopct="%1.1f%%", startangle=90)
-            ax2.legend(wedges, labels_c, loc="center left", bbox_to_anchor=(1.0, 0.5)); ax2.set_title("Distribuzione costo per attività"); ax2.axis('equal')
+            ax2.legend(wedges, labels_c, loc="center left", bbox_to_anchor=(1.0, 0.5))
+            ax2.set_title("Distribuzione costo per attività")
+            ax2.axis("equal")
         else:
-            ax2.text(0.5, 0.5, "Nessun costo calcolato", ha='center', va='center'); ax2.set_title("Distribuzione costo per attività")
-        fig2.tight_layout(); self.pie_cost_canvas.draw()
-
-    def _adjust_table_height(self, tbl: QTableWidget, max_visible_rows: int = 8):
-        rows = max(1, min(tbl.rowCount(), max_visible_rows))
-        row_h = tbl.verticalHeader().defaultSectionSize()
-        header_h = tbl.horizontalHeader().height()
-        frame = tbl.frameWidth() * 2
-        total_h = header_h + rows * row_h + frame + 12
-        tbl.setMinimumHeight(total_h)
+            ax2.text(0.5, 0.5, "Nessun costo calcolato", ha="center", va="center")
+            ax2.set_title("Distribuzione costo per attività")
+        fig2.tight_layout()
+        self.pie_cost_canvas.draw()
 
 
-# ---------- QuoteForm main (usa le classi definite sopra) ----------
+# ---------- QuoteForm ----------
 class QuoteForm(QWidget):
+    refreshRequested = Signal()
+    saveRequested = Signal()
+    loadRequested = Signal()
+    editCoeffsRequested = Signal()
+
     def __init__(self, parent=None):
         super().__init__(parent)
+
         self.coeffs: QuoteCoeffs = DEFAULT_COEFFS
 
         vbox = QVBoxLayout(self)
@@ -646,16 +864,30 @@ class QuoteForm(QWidget):
         self.save_btn = QPushButton("Salva")
         self.refresh_btn = QPushButton("Aggiorna")
         btn_row.addStretch()
-        btn_row.addWidget(self.load_btn); btn_row.addWidget(self.coeffs_btn); btn_row.addWidget(self.save_btn); btn_row.addWidget(self.refresh_btn)
+        btn_row.addWidget(self.load_btn)
+        btn_row.addWidget(self.coeffs_btn)
+        btn_row.addWidget(self.save_btn)
+        btn_row.addWidget(self.refresh_btn)
         vbox.addLayout(btn_row)
 
-        # collegamenti
-        self.refresh_btn.clicked.connect(self.recalc)
-        self.coeffs_btn.clicked.connect(self.open_coeffs_dialog)
-        self.save_btn.clicked.connect(self.save_to_file)
-        self.load_btn.clicked.connect(self.load_from_file)
+        self.refresh_btn.clicked.connect(self.refreshRequested.emit)
+        self.save_btn.clicked.connect(self.saveRequested.emit)
+        self.load_btn.clicked.connect(self.loadRequested.emit)
+        self.coeffs_btn.clicked.connect(self.editCoeffsRequested.emit)
 
-        QTimer.singleShot(50, self.recalc)
+        self._clear_sel_filter = _ClearSelectionFilter([
+            self.board.holes_table,
+            self.board.keep_table,
+            self.board.summary_table,
+            self.hs.table,
+            self.results.totals_table,
+        ])
+        self.installEventFilter(self._clear_sel_filter)
+
+        QTimer.singleShot(50, self.refreshRequested.emit)
+
+    def load_inputs(self, inp: LayoutQuoteInputs) -> None:
+        self._robust_load_inputs(inp)
 
     def open_coeffs_dialog(self):
         dlg = CoeffsDialog(self.coeffs, parent=self)
@@ -664,8 +896,16 @@ class QuoteForm(QWidget):
             self.recalc()
 
     def collect_inputs(self) -> LayoutQuoteInputs:
-        tariffs = Tariffs(layout_eur_per_h=float(self.general.tar_layout.value()), si_pi_eur_per_h=float(self.general.tar_si.value()))
-        board = BoardConstraints(width_mm=float(self.board.w_mm.value()), height_mm=float(self.board.h_mm.value()), holes=self.board.collect_holes(), keepouts=self.board.collect_keepouts())
+        tariffs = Tariffs(
+            layout_eur_per_h=float(self.general.tar_layout.value()),
+            si_pi_eur_per_h=float(self.general.tar_si.value()),
+        )
+        board = BoardConstraints(
+            width_mm=float(self.board.w_mm.value()),
+            height_mm=float(self.board.h_mm.value()),
+            holes=self.board.collect_holes(),
+            keepouts=self.board.collect_keepouts(),
+        )
         comps = ComponentsInputs(
             bga_count=int(self.components.bga_count.value()),
             bga_total_pins_effective=int(self.components.bga_pins.value()),
@@ -679,65 +919,39 @@ class QuoteForm(QWidget):
             tht=bool(self.components.tht.isChecked()),
         )
         hs = HighSpeedInputs(interfaces=self.hs.collect_interfaces())
-        return LayoutQuoteInputs(board=board, components=comps, highspeed=hs, buffer_pct=float(self.general.buffer.value()), week_hours=float(self.general.week_hours.value()), tariffs=tariffs)
-
-    def _serialize_inputs(self, inp: LayoutQuoteInputs) -> dict:
-        b = inp.board; c = inp.components; hs = inp.highspeed
-        return {
-            "tariffs": asdict(inp.tariffs),
-            "buffer_pct": float(inp.buffer_pct),
-            "week_hours": float(inp.week_hours),
-            "board": {
-                "width_mm": float(b.width_mm),
-                "height_mm": float(b.height_mm),
-                "holes": [{"diameter_mm": h.diameter_mm, "metallization_mm": getattr(h, "metallization_mm", 0.0), "count": h.count} for h in getattr(b, "holes", [])],
-                "keepouts": [{"side": k.side, "width_mm": k.width_mm, "height_mm": k.height_mm, "count": k.count} for k in getattr(b, "keepouts", [])],
-            },
-            "components": asdict(c),
-            "highspeed": {"interfaces": [asdict(it) for it in getattr(hs, "interfaces", [])]},
-            "coeffs": asdict(self.coeffs),
-        }
-
-    def save_to_file(self):
-        try:
-            inp = self.collect_inputs()
-            data = self._serialize_inputs(inp)
-            fname, _ = QFileDialog.getSaveFileName(self, "Salva file", "", "JSON files (*.json);;All files (*)")
-            if not fname: return
-            with open(fname, "w", encoding="utf-8") as f: json.dump(data, f, ensure_ascii=False, indent=2)
-        except Exception as e:
-            QMessageBox.critical(self, "Errore salvataggio", f"Errore durante il salvataggio: {e}")
-
-    def load_from_file(self):
-        try:
-            fname, _ = QFileDialog.getOpenFileName(self, "Apri file", "", "JSON files (*.json);;All files (*)")
-            if not fname: return
-            with open(fname, "r", encoding="utf-8") as f: data = json.load(f)
-            if "coeffs" in data:
-                try:
-                    coeffs_d = data["coeffs"]
-                    self.coeffs = QuoteCoeffs(**{k: float(v) for k, v in coeffs_d.items()})
-                except Exception:
-                    pass
-            self._robust_load_inputs(data)
-        except Exception as e:
-            QMessageBox.critical(self, "Errore caricamento", f"Errore durante il caricamento: {e}")
+        return LayoutQuoteInputs(
+            board=board,
+            components=comps,
+            highspeed=hs,
+            buffer_pct=float(self.general.buffer.value()),
+            week_hours=float(self.general.week_hours.value()),
+            tariffs=tariffs,
+        )
 
     def _robust_load_inputs(self, inp: Any):
         if isinstance(inp, dict):
-            tariffs_d = inp.get("tariffs") or inp.get("tariffe") or {}
-            tariffs = Tariffs(layout_eur_per_h=float(tariffs_d.get("layout_eur_per_h", tariffs_d.get("layout", 75.0))), si_pi_eur_per_h=float(tariffs_d.get("si_pi_eur_per_h", tariffs_d.get("si", 90.0))))
-            buffer_pct = float(inp.get("buffer_pct", inp.get("buffer", 0.25)))
-            week_hours = float(inp.get("week_hours", inp.get("week_hours", 40.0)))
-            board_d = inp.get("board", {})
+            inputs_d = inp.get("inputs", inp)
+            if not isinstance(inputs_d, dict):
+                return
+
+            tariffs_d = inputs_d.get("tariffs") or inputs_d.get("tariffe") or {}
+            tariffs = Tariffs(
+                layout_eur_per_h=float(tariffs_d.get("layout_eur_per_h", tariffs_d.get("layout", 75.0))),
+                si_pi_eur_per_h=float(tariffs_d.get("si_pi_eur_per_h", tariffs_d.get("si", 90.0))),
+            )
+            buffer_pct = float(inputs_d.get("buffer_pct", inputs_d.get("buffer", 0.25)))
+            week_hours = float(inputs_d.get("week_hours", 40.0))
+
+            board_d = inputs_d.get("board", {}) or {}
             width_mm = float(board_d.get("width_mm", board_d.get("width", 180.0)))
             height_mm = float(board_d.get("height_mm", board_d.get("height", 140.0)))
-            holes_raw = board_d.get("holes", board_d.get("fori", []))
-            keepouts_raw = board_d.get("keepouts", board_d.get("keepouts", []))
+            holes_raw = board_d.get("holes", board_d.get("fori", [])) or []
+            keepouts_raw = board_d.get("keepouts", board_d.get("keepouts", [])) or []
             holes_parsed = [h for h in (_parse_hole_entry(x) for x in holes_raw) if h]
             keepouts_parsed = [k for k in (_parse_keepout_entry(x) for x in keepouts_raw) if k]
             board = BoardConstraints(width_mm=width_mm, height_mm=height_mm, holes=holes_parsed, keepouts=keepouts_parsed)
-            comps_d = inp.get("components", {})
+
+            comps_d = inputs_d.get("components", {}) or {}
             comps = ComponentsInputs(
                 bga_count=int(comps_d.get("bga_count", comps_d.get("bga", 0))),
                 bga_total_pins_effective=int(comps_d.get("bga_total_pins_effective", comps_d.get("bga_pins", 0))),
@@ -750,21 +964,34 @@ class QuoteForm(QWidget):
                 hdi=bool(comps_d.get("hdi", comps_d.get("is_hdi", False))),
                 tht=bool(comps_d.get("tht", comps_d.get("is_tht", False))),
             )
-            hs_raw = inp.get("highspeed", {}).get("interfaces", inp.get("highspeed", inp.get("interfaces", [])))
+
+            hs_raw = (inputs_d.get("highspeed", {}) or {}).get("interfaces", inputs_d.get("interfaces", [])) or []
             hs_parsed = [h for h in (_parse_hs_entry(x) for x in hs_raw) if h]
             hs = HighSpeedInputs(interfaces=hs_parsed)
-            inp_obj = LayoutQuoteInputs(board=board, components=comps, highspeed=hs, buffer_pct=buffer_pct, week_hours=week_hours, tariffs=tariffs)
+
+            inp_obj = LayoutQuoteInputs(
+                board=board,
+                components=comps,
+                highspeed=hs,
+                buffer_pct=buffer_pct,
+                week_hours=week_hours,
+                tariffs=tariffs,
+            )
         else:
             inp_obj = inp
 
+        # apply UI
         try:
-            self.general.tar_layout.setValue(float(inp_obj.tariffs.layout_eur_per_h)); self.general.tar_si.setValue(float(inp_obj.tariffs.si_pi_eur_per_h))
-            self.general.buffer.setValue(float(inp_obj.buffer_pct)); self.general.week_hours.setValue(float(inp_obj.week_hours))
+            self.general.tar_layout.setValue(float(inp_obj.tariffs.layout_eur_per_h))
+            self.general.tar_si.setValue(float(inp_obj.tariffs.si_pi_eur_per_h))
+            self.general.buffer.setValue(float(inp_obj.buffer_pct))
+            self.general.week_hours.setValue(float(inp_obj.week_hours))
         except Exception:
             pass
 
         try:
-            self.board.w_mm.setValue(float(inp_obj.board.width_mm)); self.board.h_mm.setValue(float(inp_obj.board.height_mm))
+            self.board.w_mm.setValue(float(inp_obj.board.width_mm))
+            self.board.h_mm.setValue(float(inp_obj.board.height_mm))
         except Exception:
             pass
 
@@ -772,7 +999,8 @@ class QuoteForm(QWidget):
         try:
             for h in getattr(inp_obj.board, "holes", []):
                 hh = _parse_hole_entry(h) if not isinstance(h, HoleType) else h
-                if hh: self.board.add_hole_row(hh.diameter_mm, getattr(hh, "metallization_mm", 0.0), hh.count)
+                if hh:
+                    self.board.add_hole_row(hh.diameter_mm, getattr(hh, "metallization_mm", 0.0), hh.count)
         except Exception:
             pass
 
@@ -780,7 +1008,8 @@ class QuoteForm(QWidget):
         try:
             for k in getattr(inp_obj.board, "keepouts", []):
                 kk = _parse_keepout_entry(k) if not isinstance(k, KeepoutRect) else k
-                if kk: self.board.add_keepout_row(kk.side, kk.width_mm, kk.height_mm, kk.count)
+                if kk:
+                    self.board.add_keepout_row(kk.side, kk.width_mm, kk.height_mm, kk.count)
         except Exception:
             pass
 
@@ -788,24 +1017,33 @@ class QuoteForm(QWidget):
 
         try:
             comps = inp_obj.components
-            self.components.bga_count.setValue(int(comps.bga_count)); self.components.bga_pins.setValue(int(comps.bga_total_pins_effective))
-            self.components.pitch.setValue(float(comps.min_bga_pitch_mm)); self.components.layers.setValue(int(comps.layers))
-            self.components.hdi.setChecked(bool(comps.hdi)); self.components.tht.setChecked(bool(comps.tht))
-            self.components.passives.setValue(int(comps.passives)); self.components.actives.setValue(int(comps.actives))
-            self.components.critical.setValue(int(comps.critical)); self.components.connectors.setValue(int(comps.connectors))
+            self.components.bga_count.setValue(int(comps.bga_count))
+            self.components.bga_pins.setValue(int(comps.bga_total_pins_effective))
+            self.components.pitch.setValue(float(comps.min_bga_pitch_mm))
+            self.components.layers.setValue(int(comps.layers))
+            self.components.hdi.setChecked(bool(comps.hdi))
+            self.components.tht.setChecked(bool(comps.tht))
+            self.components.passives.setValue(int(comps.passives))
+            self.components.actives.setValue(int(comps.actives))
+            self.components.critical.setValue(int(comps.critical))
+            self.components.connectors.setValue(int(comps.connectors))
         except Exception:
             pass
 
+        # HS
         self.hs.table.setRowCount(0)
         try:
             for it in getattr(inp_obj.highspeed, "interfaces", []):
                 parsed = _parse_hs_entry(it) if not isinstance(it, HighSpeedInterface) else it
-                if parsed: self.hs.add_row((parsed.name, parsed.data_rate_gbps, parsed.diff_pairs, parsed.se_lines, parsed.match_ps))
+                if parsed:
+                    self.hs.add_row((parsed.name, parsed.data_rate_gbps, parsed.diff_pairs, parsed.se_lines, parsed.match_ps))
         except Exception:
             pass
 
-        try: self.recalc()
-        except Exception: pass
+        try:
+            self.recalc()
+        except Exception:
+            pass
 
     def recalc(self):
         self.board.update_area_summary()

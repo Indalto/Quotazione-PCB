@@ -62,7 +62,10 @@ class MainWindow(QMainWindow):
             d = io_utils.load_json(path)
             inp, coeffs = io_utils.dict_to_inputs(d)
             self.form.coeffs = coeffs
+
+            # ora esiste sempre (fixato in forms.py)
             self.form.load_inputs(inp)
+
             self.on_refresh()
             self.status_msg.setText("Progetto caricato")
         except Exception as e:

@@ -6,27 +6,16 @@
       "holes": [
         {
           "diameter_mm": 3.2,
+          "metallization_mm": 0.0,
           "count": 15
         },
         {
           "diameter_mm": 12.0,
+          "metallization_mm": 0.0,
           "count": 4
         }
       ],
-      "keepouts": [
-        {
-          "side": "TOP",
-          "width_mm": 20.0,
-          "height_mm": 10.0,
-          "count": 2
-        },
-        {
-          "side": "BOTTOM",
-          "width_mm": 15.0,
-          "height_mm": 8.0,
-          "count": 2
-        }
-      ]
+      "keepouts": []
     },
     "components": {
       "bga_count": 3,
@@ -129,22 +118,26 @@
     }
   },
   "coeffs": {
-    "ps_to_mil_approx": 3.94,
-    "k_place_bga_base_h": 40.0,
-    "k_place_per_bga_h": 8.0,
-    "k_place_pins_per_100_h": 4.0,
-    "k_place_passive_h": 0.002,
-    "k_place_active_h": 0.3,
-    "k_place_critical_h": 1.0,
-    "k_place_connector_h": 0.1,
+    "sys_study_system_h": 8.0,
+    "sys_setup_pcb_h": 4.0,
+    "sys_mech_study_h": 6.0,
+    "sys_dfm_documentation_h": 4.0,
+    "k_place_bga_base_h": 6.0,
+    "k_place_per_bga_h": 2.0,
+    "k_place_pins_per_100_min": 60.0,
+    "k_place_passive_min": 0.12,
+    "k_place_active_min": 1.8,
+    "k_place_critical_min": 12.0,
+    "k_place_connector_min": 6.0,
     "k_hdi_multiplier": 1.15,
     "k_route_std_base_h": 20.0,
     "k_route_density_scale_h": 18.0,
-    "k_route_diff_pair_h": 0.55,
-    "k_route_se_h": 0.18,
+    "k_route_trace_min": 0.6,
+    "k_route_diff_pair_min": 33.0,
+    "k_route_se_min": 10.8,
     "k_si_base_h": 12.0,
-    "k_si_per_interface_h": 4.0,
+    "k_si_per_interface_min": 240.0,
     "k_si_rate_multiplier": 1.0,
-    "k_dfm_pct": 0.12
+    "k_cleanup_pct": 0.12
   }
 }

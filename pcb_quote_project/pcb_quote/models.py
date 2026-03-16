@@ -12,11 +12,17 @@ class Tariffs:
 @dataclass
 class HoleType:
     diameter_mm: float
-    count: int
+    metallization_mm: float = 0.0  # nuovo campo: spessore metallizzazione (radiale) in mm
+    count: int = 1
+
+    @property
+    def effective_diameter_mm(self) -> float:
+        # la metallizzazione viene considerata come spessore radiale su entrambi i lati del foro
+        return float(self.diameter_mm) + 2.0 * float(self.metallization_mm)
 
     @property
     def area_mm2(self) -> float:
-        r = self.diameter_mm / 2.0
+        r = self.effective_diameter_mm / 2.0
         return 3.141592653589793 * r * r * float(self.count)
 
 

@@ -7,47 +7,44 @@ from .models import LayoutQuoteInputs
 
 @dataclass
 class QuoteCoeffs:
-    # visual hint conversion only
-    ps_to_mil_approx: float = 3.94
+    # --- Coefficienti di sistema (ore, valori di partenza) ---
+    sys_study_system_h: float = 8.0          # Studio sistema e analisi documentazione (ore)
+    sys_setup_pcb_h: float = 4.0            # Setup iniziale PCB (stack-up, constraint) (ore)
+    sys_mech_study_h: float = 6.0           # Studio meccanico (ore)
+    sys_dfm_documentation_h: float = 4.0    # Documentazione di fabbricazione / pre-produzione (ore)
 
-    # Placement
+    # --- Placement (alcuni valori in ore, altri in minuti per dettaglio) ---
     k_place_bga_base_h: float = 6.0
     k_place_per_bga_h: float = 2.0
-    k_place_pins_per_100_h: float = 1.0
+    k_place_pins_per_100_min: float = 60.0  # minuti per 100 pin BGA
 
-    # Component categories
-    k_place_passive_h: float = 0.002
-    k_place_active_h: float = 0.03
-    k_place_critical_h: float = 0.20
-    k_place_connector_h: float = 0.10
+    # placement per tipo (minuti per pezzo)
+    k_place_passive_min: float = 0.12
+    k_place_active_min: float = 1.8
+    k_place_critical_min: float = 12.0
+    k_place_connector_min: float = 6.0
 
-    # HDI multiplier
+    # HDI multiplier (dimensionless)
     k_hdi_multiplier: float = 1.15
 
-    # Routing (standard)
+    # --- Routing standard (ore + dettaglio tracce in minuti) ---
     k_route_std_base_h: float = 20.0
     k_route_density_scale_h: float = 18.0
+    k_route_trace_min: float = 0.6  # minuti per traccia (sbroglio per traccia)
 
-    # Routing (high speed)
-    k_route_diff_pair_h: float = 0.55
-    k_route_se_h: float = 0.18
+    # --- Routing High-speed (minuti per unità) ---
+    k_route_diff_pair_min: float = 33.0  # min / coppia
+    k_route_se_min: float = 10.8         # min / linea SE
 
-    # SI/PI
+    # --- SI/PI ---
     k_si_base_h: float = 12.0
-    k_si_per_interface_h: float = 4.0
-
-    # NEW: SI scaling with data-rate difficulty (applied to per-interface SI)
+    k_si_per_interface_min: float = 240.0  # min / interfaccia
     k_si_rate_multiplier: float = 1.0
 
-    # DFM/Cleanup
-    k_dfm_pct: float = 0.12
-
+    # --- DFM / cleanup ---
+    k_cleanup_pct: float = 0.12  # 12% applied to placement + routing (proportional cleanup)
 
 DEFAULT_COEFFS = QuoteCoeffs()
-
-
-def ps_to_mil(ps: float, coeffs: QuoteCoeffs) -> float:
-    return float(ps) * float(coeffs.ps_to_mil_approx)
 
 
 def _safe_div(n: float, d: float) -> float:
@@ -65,7 +62,7 @@ def _density_pin_per_cm2_layer_sides(inp: LayoutQuoteInputs) -> Tuple[float, flo
 
 
 def _density_effective(dens_top: float, dens_bottom: float) -> float:
-    # Conservative: bottleneck side dominates complexity
+    # Lato più critico domina la complessità
     return max(float(dens_top), float(dens_bottom))
 
 
@@ -115,6 +112,32 @@ def _severity_from_data_rate(data_rate_gbps: float) -> float:
     return 1.70
 
 
+def _system_scaling_factor(inp: LayoutQuoteInputs, dens_eff: float, coeffs: QuoteCoeffs) -> float:
+    """
+    Calcola un fattore moltiplicativo semplice per i coefficienti di sistema in funzione
+    della complessità: layers, densità efficace, numero di interfacce HS e HDI.
+    Formula base (configurabile in futuro):
+      scale = 1.0
+      + 0.05 * max(0, (layers - 4) / 4)
+      + 0.10 * max(0, (dens_eff - 10) / 10)
+      + 0.05 * n_hs_interfaces
+      then if HDI -> moltiplica per k_hdi_multiplier
+    """
+    layers = float(max(inp.components.layers, 1))
+    n_hs = len(inp.highspeed.interfaces)
+    scale = 1.0
+    # impatto dei layer
+    scale += 0.05 * max(0.0, (layers - 4.0) / 4.0)
+    # impatto densità
+    scale += 0.10 * max(0.0, (dens_eff - 10.0) / 10.0)
+    # impatto numero interfacce HS
+    scale += 0.05 * float(n_hs)
+    # HDI potenzia ulteriormente
+    if inp.components.hdi:
+        scale *= float(coeffs.k_hdi_multiplier)
+    return scale
+
+
 def estimate_layout_quote(inp: LayoutQuoteInputs, coeffs: QuoteCoeffs | None = None) -> Dict[str, Any]:
     coeffs = coeffs or DEFAULT_COEFFS
 
@@ -125,60 +148,88 @@ def estimate_layout_quote(inp: LayoutQuoteInputs, coeffs: QuoteCoeffs | None = N
     f_density = _f_density(dens_eff)
     f_hdi = _f_hdi(inp, coeffs)
 
-    # Placement
+    # --- Placement ---
+    # converti i valori in minuti -> ore dove necessario
+    place_pins_h = (float(coeffs.k_place_pins_per_100_min) / 60.0) * (float(inp.components.bga_total_pins_effective) / 100.0)
+    place_passives_h = (float(coeffs.k_place_passive_min) / 60.0) * float(inp.components.passives)
+    place_actives_h = (float(coeffs.k_place_active_min) / 60.0) * float(inp.components.actives)
+    place_critical_h = (float(coeffs.k_place_critical_min) / 60.0) * float(inp.components.critical)
+    place_connectors_h = (float(coeffs.k_place_connector_min) / 60.0) * float(inp.components.connectors)
+
     t_place = (
         (coeffs.k_place_bga_base_h + coeffs.k_place_per_bga_h * float(inp.components.bga_count))
-        + coeffs.k_place_pins_per_100_h * (float(inp.components.bga_total_pins_effective) / 100.0)
-        + coeffs.k_place_passive_h * float(inp.components.passives)
-        + coeffs.k_place_active_h * float(inp.components.actives)
-        + coeffs.k_place_critical_h * float(inp.components.critical)
-        + coeffs.k_place_connector_h * float(inp.components.connectors)
+        + place_pins_h
+        + place_passives_h
+        + place_actives_h
+        + place_critical_h
+        + place_connectors_h
     ) * f_pitch * f_density * f_hdi
 
-    # High-speed routing per interface
+    # --- High-speed routing per interface ---
     t_route_hs = 0.0
     hs_breakdown: List[Dict[str, Any]] = []
     for itf in inp.highspeed.interfaces:
         sev = _severity_from_match_ps(itf.match_ps) * _severity_from_data_rate(itf.data_rate_gbps)
-        t_diff = float(coeffs.k_route_diff_pair_h) * float(itf.diff_pairs) * sev
-        t_se = float(coeffs.k_route_se_h) * float(itf.se_lines) * sev
+        t_diff = (float(coeffs.k_route_diff_pair_min) / 60.0) * float(itf.diff_pairs) * sev
+        t_se = (float(coeffs.k_route_se_min) / 60.0) * float(itf.se_lines) * sev
         t_route_hs += (t_diff + t_se)
         hs_breakdown.append({
             "name": itf.name,
             "data_rate_gbps": itf.data_rate_gbps,
             "match_ps": itf.match_ps,
-            "match_mil_approx": ps_to_mil(itf.match_ps, coeffs),
             "diff_pairs": itf.diff_pairs,
             "se_lines": itf.se_lines,
             "severity": sev,
             "hours_total": t_diff + t_se,
         })
 
-    # Standard routing uses dens_eff
-    t_route_std = float(coeffs.k_route_std_base_h) * f_density + (float(coeffs.k_route_density_scale_h) * dens_eff / 10.0)
+    # --- Routing standard ---
+    # conteggio tracce standard dalle assunzioni: passivi=2, attivi=10, connettori=10
+    traces_stand = float(inp.components.passives) * 2.0 + float(inp.components.actives) * 10.0 + float(inp.components.connectors) * 10.0
+    # tempo per traccia (min -> h) e scaling per densità
+    t_route_traces = (float(coeffs.k_route_trace_min) / 60.0) * traces_stand * f_density
+
+    t_route_std = float(coeffs.k_route_std_base_h) * f_density + (float(coeffs.k_route_density_scale_h) * dens_eff / 10.0) + t_route_traces
     t_route_total = t_route_hs + t_route_std
 
-    # SI/PI: base + per-interface scaled by data-rate severity
+    # --- SI/PI ---
     t_si = float(coeffs.k_si_base_h) * (1.0 + 0.15 * (f_density - 1.0))
     for itf in inp.highspeed.interfaces:
         rate_sev = _severity_from_data_rate(itf.data_rate_gbps)
-        t_si += float(coeffs.k_si_per_interface_h) * float(coeffs.k_si_rate_multiplier) * rate_sev
+        t_si += (float(coeffs.k_si_per_interface_min) / 60.0) * float(coeffs.k_si_rate_multiplier) * rate_sev
 
-    # DFM
-    t_dfm = float(coeffs.k_dfm_pct) * (t_place + t_route_total)
+    # --- DFM / Cleanup ---
+    # t_cleanup_prop: parte proporzionale (percentuale su placement + routing totale)
+    t_cleanup_prop = float(coeffs.k_cleanup_pct) * (t_place + t_route_total)
+    # t_dfm_doc_fixed is provided as sys_dfm_documentation_h (ore fisse)
+    t_dfm_doc_fixed = float(coeffs.sys_dfm_documentation_h)
+    t_dfm_total = t_cleanup_prop + t_dfm_doc_fixed
 
+    # --- System coefficients (fissi ma scalabili in funzione della complessità) ---
+    sys_fixed = float(coeffs.sys_study_system_h) + float(coeffs.sys_setup_pcb_h) + float(coeffs.sys_mech_study_h)
+    sys_scale = _system_scaling_factor(inp, dens_eff, coeffs)
+    t_system = sys_fixed * sys_scale
+
+    # Buffer
     buffer_factor = 1.0 + float(inp.buffer_pct)
 
+    # Hours breakdown (prima del buffer)
     hours = {
+        "System": t_system,
         "Placement": t_place,
         "Routing HS": t_route_hs,
         "Routing STD": t_route_std,
         "SI/PI": t_si,
-        "DFM/Cleanup": t_dfm,
+        "DFM Documentation (fixed)": t_dfm_doc_fixed,
+        "DFM/Cleanup (proportional)": t_cleanup_prop,
     }
+
+    # Applichiamo buffer (sulle attività operative)
     hours_buf = {k: v * buffer_factor for k, v in hours.items()}
+
     total_h = sum(hours_buf.values())
 
+    # Weeks e costi
     week_hours = float(inp.week_hours) if inp.week_hours else 40.0
     weeks_buf = {k: (v / week_hours) for k, v in hours_buf.items()}
     total_w = total_h / week_hours
@@ -188,8 +239,12 @@ def estimate_layout_quote(inp: LayoutQuoteInputs, coeffs: QuoteCoeffs | None = N
 
     costs_buf = {}
     for k, hbuf in hours_buf.items():
-        rate = si_rate if k == "SI/PI" else layout_rate
+        if k == "SI/PI":
+            rate = si_rate
+        else:
+            rate = layout_rate
         costs_buf[k] = hbuf * rate
+
     total_cost = sum(costs_buf.values())
 
     return {
@@ -214,6 +269,9 @@ def estimate_layout_quote(inp: LayoutQuoteInputs, coeffs: QuoteCoeffs | None = N
             "f_pitch": f_pitch,
             "f_density": f_density,
             "f_hdi": f_hdi,
+            "traces_stand": traces_stand,
+            "t_route_traces": t_route_traces,
+            "sys_scale": sys_scale,
         },
         "highspeed": {"interfaces": hs_breakdown},
         "breakdown": {
